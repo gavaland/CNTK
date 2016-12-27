@@ -14,6 +14,7 @@
 #include "PerformanceProfiler.h"
 #include "Basics.h"
 #include "fileutil.h"
+#include <chrono>
 #include <memory>
 #include <stdio.h>
 #include <time.h>
@@ -103,7 +104,6 @@ struct ProfilerState
     bool                    cudaSyncEnabled;             // Runtime state of CUDA kernel sync
     std::wstring            profilerDir;                 // Directory where reports/logs are saved
     std::wstring            logSuffix;                   // Suffix to append to report/log file names
-    long long               clockFrequency;              // Timer frequency
     FixedEventRecord        fixedEvents[profilerEvtMax]; // Profiling data for each fixed event
     bool                    customEventBufferFull;       // Is custom event buffer full?
     unsigned long long      customEventBufferBytes;      // Number of bytes allocated for the custom event buffer
@@ -118,7 +118,6 @@ static unique_ptr<ProfilerState> g_profilerState;
 // Forward declarations
 unsigned int GetThreadId();
 
-long long GetClockFrequency();
 long long GetClock();
 
 void LockInit();
@@ -166,8 +165,6 @@ void PERF_PROFILER_API ProfilerInit(const std::wstring& profilerDir, const unsig
     g_profilerState->customEventBufferBytes = customEventBufferBytes;
     g_profilerState->customEventOffset = 0ull;
     g_profilerState->customEventBuffer.reset(new char[customEventBufferBytes]);
-
-    g_profilerState->clockFrequency = GetClockFrequency();
 
     g_profilerState->syncGpu = syncGpu;
     g_profilerState->enabled = false;
@@ -333,7 +330,7 @@ void PERF_PROFILER_API ProfilerThroughputEnd(const long long stateId, const int 
         return;
 
     // Use kB rather than bytes to prevent overflow
-    long long kBytesPerSec = ((bytes * g_profilerState->clockFrequency) / 1000) / (endClock - beginClock);
+    long long kBytesPerSec = (bytes  * 1000000) / (endClock - beginClock);
     if (g_profilerState->fixedEvents[eventId].cnt == 0)
     {
         g_profilerState->fixedEvents[eventId].min = kBytesPerSec;
@@ -395,38 +392,16 @@ unsigned int GetThreadId()
 }
 
 //
-// Return freqeuncy in Hz of clock.
-//
-long long GetClockFrequency()
-{
-    long long frequency;
-
-#ifdef _WIN32
-    QueryPerformanceFrequency((LARGE_INTEGER*)&frequency);
-#else
-    timespec res;
-    clock_getres(CLOCK_REALTIME, &res);
-    frequency = 1000000000ll / ((long long)res.tv_nsec + 1000000000ll * (long long)res.tv_sec);
-#endif
-
-    return frequency;
-}
-
-//
-// Get current timestamp.
+// Get current timestamp (in nanoseconds).
 //
 long long GetClock()
 {
-    long long tm;
-#ifdef _WIN32
-    QueryPerformanceCounter((LARGE_INTEGER*)&tm);
-#else
-    timespec t;
-    clock_gettime(CLOCK_REALTIME, &t);
-    tm = (long long)t.tv_nsec + 1000000000ll * (long long)t.tv_sec;
-#endif
-
-    return tm;
+    //                          clock_gettime/QPC         high_resolution_clock
+    // Linux (libstdc++6)             1-3 ns                     1-3 ns
+    // Windows (VS2015)                 7 ns                      27 ns
+    //
+    // The resolution of times reported in the summary report is 0.001 s = 1000 ns.
+    return chrono::high_resolution_clock::now().time_since_epoch().count();
 }
 
 
@@ -527,27 +502,27 @@ void ProfilerGenerateReport(const std::wstring& fileName, struct tm* timeInfo)
 
                 char str[32];
 
-                double mean = ((double)g_profilerState->fixedEvents[evtIdx].sum / (double)g_profilerState->fixedEvents[evtIdx].cnt) / (double)g_profilerState->clockFrequency;
+                double mean = ((double)g_profilerState->fixedEvents[evtIdx].sum / (double)g_profilerState->fixedEvents[evtIdx].cnt) / 1000000000;
                 FormatTimeStr(str, sizeof(str), mean);
                 fprintfOrDie(f, "%s ", str);
 
-                double sum = (double)g_profilerState->fixedEvents[evtIdx].sum / (double)g_profilerState->clockFrequency;
-                double sumsq = g_profilerState->fixedEvents[evtIdx].sumsq / (double)g_profilerState->clockFrequency / (double)g_profilerState->clockFrequency;
+                double sum = (double)g_profilerState->fixedEvents[evtIdx].sum / 1000000000;
+                double sumsq = g_profilerState->fixedEvents[evtIdx].sumsq / 1000000000 / 1000000000;
                 double stdDev = sumsq - (pow(sum, 2.0) / (double)g_profilerState->fixedEvents[evtIdx].cnt);
                 if (stdDev < 0.0) stdDev = 0.0;
                 stdDev = sqrt(stdDev / (double)g_profilerState->fixedEvents[evtIdx].cnt);
                 FormatTimeStr(str, sizeof(str), stdDev);
                 fprintfOrDie(f, "%s ", str);
 
-                FormatTimeStr(str, sizeof(str), (double)g_profilerState->fixedEvents[evtIdx].min / (double)g_profilerState->clockFrequency);
+                FormatTimeStr(str, sizeof(str), (double)g_profilerState->fixedEvents[evtIdx].min / 1000000000);
                 fprintfOrDie(f, "%s ", str);
 
-                FormatTimeStr(str, sizeof(str), (double)g_profilerState->fixedEvents[evtIdx].max / (double)g_profilerState->clockFrequency);
+                FormatTimeStr(str, sizeof(str), (double)g_profilerState->fixedEvents[evtIdx].max / 1000000000);
                 fprintfOrDie(f, "%s ", str);
 
                 fprintfOrDie(f, "%16d ", g_profilerState->fixedEvents[evtIdx].cnt);
 
-                FormatTimeStr(str, sizeof(str), (double)g_profilerState->fixedEvents[evtIdx].sum / (double)g_profilerState->clockFrequency);
+                FormatTimeStr(str, sizeof(str), (double)g_profilerState->fixedEvents[evtIdx].sum / 1000000000);
                 fprintfOrDie(f, "%s", str);
             }
             break;
@@ -653,8 +628,8 @@ void ProfilerGenerateDetailFile(const std::wstring& fileName)
         eventPtr += sizeof(CustomEventRecord);
 
         fprintfOrDie(f, "\"%s\",%u,%.8f,%.8f\n", descriptionStr, eventRecord->threadId, 
-            1000.0 * ((double)eventRecord->beginClock / (double)g_profilerState->clockFrequency),
-            1000.0 * ((double)eventRecord->endClock / (double)g_profilerState->clockFrequency));
+            1000.0 * ((double)eventRecord->beginClock / 1000000000),
+            1000.0 * ((double)eventRecord->endClock / 1000000000));
     }
 
     fclose(f);
